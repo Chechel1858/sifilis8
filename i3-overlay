@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import font as tkFont
+import psutil, datetime, threading, time, os, signal, math, subprocess
+
+class AdvancedOverlay:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.attributes('-type', 'splash')
+        self.root.attributes('-topmost', True)
+        self.root.overrideredirect(True)
+        self.root.attributes('-alpha', 0.95)
+        
+        self.width, self.height = 380, 580
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.x = screen_w - self.width - 20
+        self.y = screen_h - self.height - 20
+        self.root.geometry(f'{self.width}x{self.height}+{self.x}+{self.y}')
+        self.root.title('i3-overlay')
+        
+        self.minimized = False
+        self.tab = 0  # 0=System, 1=Network, 2=Processes
+        self.pulse = 0
+        self.anim = {'cpu': 0, 'ram': 0, 'disk': 0}
+        self.target = {'cpu': 0, 'ram': 0, 'disk': 0}
+        
+        bg = '#0a0e16'
+        self.root.configure(bg=bg)
+        
+        # Top bar
+        top = tk.Canvas(self.root, bg='#0f1821', height=38, highlightthickness=0, bd=0)
+        top.pack(fill=tk.X)
+        
+        top.create_text(14, 19, text='◆ SYSTEM MONITOR', font=('monospace', 9, 'bold'), 
+                       fill='#00d4ff', anchor='w')
+        
+        btn = tk.Button(top, text='━', font=('monospace', 10, 'bold'), fg='#00d4ff', 
+                       bg='#0f1821', bd=0, command=self.toggle, cursor='hand2', 
+                       activebackground='#1a2a38', activeforeground='#00d4ff')
+        top.create_window(360, 19, window=btn)
+        
+        top.bind('<Button-1>', self.start_drag)
+        top.bind('<B1-Motion>', self.do_drag)
+        
+        # Tabs
+        tab_bar = tk.Canvas(self.root, bg='#0a0e16', height=32, highlightthickness=0, bd=0)
+        tab_bar.pack(fill=tk.X)
+        
+        for i, name in enumerate(['SYSTEM', 'NETWORK', 'PROCESS']):
+            x = 20 + i * 120
+            tab_bar.create_text(x, 16, text=name, font=('monospace', 8, 'bold'), 
+                               fill='#00d4ff', anchor='w', tags=f'tab{i}')
+            tab_bar.tag_bind(f'tab{i}', '<Button-1>', lambda e, t=i: self.switch_tab(t))
+        
+        self.tab_bar = tab_bar
+        
+        # Main canvas
+        self.canvas = tk.Canvas(self.root, bg=bg, highlightthickness=0, bd=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=0, pady=8)
+        
+        self.fonts = {
+            'title': tkFont.Font(family='monospace', size=8, weight='bold'),
+            'big': tkFont.Font(family='monospace', size=20, weight='bold'),
+            'norm': tkFont.Font(family='monospace', size=9, weight='bold'),
+            'small': tkFont.Font(family='monospace', size=7),
+            'tiny': tkFont.Font(family='monospace', size=6),
+        }
+        
+        self.stats = {
+            'time': '--:--:--', 'date': '--', 'cpu': 0, 'ram': 0, 'disk': 0,
+            'temp': 0, 'up': 0, 'down': 0, 'ping': 0, 'uptime': '0d', 
+            'hostname': 'unknown', 'processes': []
+        }
+        
+        self._pn = psutil.net_io_counters()
+        self._pt = time.time()
+        
+        threading.Thread(target=self._update_stats, daemon=True).start()
+        threading.Thread(target=self._animate, daemon=True).start()
+        self.root.after(50, self._draw)
+        
+        signal.signal(signal.SIGUSR1, lambda s, f: self.toggle())
+    
+    def start_drag(self, e):
+        self._dx = e.x_root - self.root.winfo_x()
+        self._dy = e.y_root - self.root.winfo_y()
+    
+    def do_drag(self, e):
+        self.x = e.x_root - self._dx
+        self.y = e.y_root - self._dy
+        self.root.geometry(f'+{self.x}+{self.y}')
+    
+    def toggle(self):
+        if self.minimized:
+            self.root.deiconify()
+            self.minimized = False
+        else:
+            self.root.withdraw()
+            self.minimized = True
+    
+    def switch_tab(self, t):
+        self.tab = t
+    
+    def _update_stats(self):
+        while True:
+            try:
+                n = datetime.datetime.now()
+                self.stats['time'] = n.strftime('%H:%M:%S')
+                self.stats['date'] = n.strftime('%d.%m').upper()
+                
+                self.target['cpu'] = psutil.cpu_percent(0.1)
+                self.target['ram'] = psutil.virtual_memory().percent
+                self.target['disk'] = psutil.disk_usage('/').percent
+                
+                try:
+                    temps = psutil.sensors_temperatures()
+                    if temps:
+                        for name, entries in temps.items():
+                            if entries:
+                                self.stats['temp'] = int(entries[0].current)
+                                break
+                except:
+                    self.stats['temp'] = 0
+                
+                net = psutil.net_io_counters()
+                ct = time.time()
+                dt = ct - self._pt
+                if dt > 0.5:
+                    self.stats['up'] = max(0, (net.bytes_sent - self._pn.bytes_sent)/dt/1048576)
+                    self.stats['down'] = max(0, (net.bytes_recv - self._pn.bytes_recv)/dt/1048576)
+                    self._pn = net
+                    self._pt = ct
+                
+                try:
+                    ping = subprocess.run(['ping', '-c', '1', '-W', '1', '8.8.8.8'], 
+                                         capture_output=True, timeout=2)
+                    if ping.returncode == 0:
+                        self.stats['ping'] = 1
+                    else:
+                        self.stats['ping'] = 0
+                except:
+                    self.stats['ping'] = -1
+                
+                s = int(n.timestamp() - psutil.boot_time())
+                d, r = divmod(s, 86400)
+                h, r = divmod(r, 3600)
+                m = r // 60
+                self.stats['uptime'] = f'{d}d {h:02d}h'
+                
+                self.stats['hostname'] = os.uname().nodename[:15]
+                
+                procs = []
+                for p in psutil.process_iter(['pid', 'name', 'cpu_percent']):
+                    try:
+                        procs.append((p.info['pid'], p.info['name'][:20], p.info['cpu_percent']))
+                    except:
+                        pass
+                self.stats['processes'] = sorted(procs, key=lambda x: x[2], reverse=True)[:8]
+            except:
+                pass
+            time.sleep(1)
+    
+    def _animate(self):
+        while True:
+            for key in ['cpu', 'ram', 'disk']:
+                diff = self.target[key] - self.anim[key]
+                self.anim[key] += diff * 0.15
+            self.pulse = (self.pulse + 0.06) % (2 * math.pi)
+            time.sleep(0.05)
+    
+    def _get_color(self, val):
+        if val > 85: return '#ff3333'
+        if val > 70: return '#ff9933'
+        if val > 50: return '#00d4ff'
+        return '#00ff88'
+    
+    def _draw_bar(self, y, val, label, unit='%'):
+        color = self._get_color(val)
+        self.canvas.create_text(14, y, text=label, font=self.fonts['title'], 
+                               fill='#00d4ff', anchor='nw')
+        
+        bar_w = 280
+        self.canvas.create_rectangle(14, y+16, 14+bar_w, y+24, 
+                                     fill='#1a2a38', outline='#2a3a48')
+        filled = int((val / 100) * bar_w)
+        if filled > 0:
+            self.canvas.create_rectangle(14, y+16, 14+filled, y+24, 
+                                        fill=color, outline=color)
+        
+        self.canvas.create_text(362, y+19, text=f'{val:5.0f}{unit}', 
+                               font=self.fonts['norm'], fill=color, anchor='e')
+    
+    def _draw_system(self):
+        y = 8
+        
+        self.canvas.create_text(190, y, text=self.stats['time'], 
+                               font=self.fonts['big'], fill='#ffffff', anchor='n')
+        y += 28
+        
+        self.canvas.create_text(190, y, text=self.stats['date'], 
+                               font=self.fonts['small'], fill='#00d4ff', anchor='n')
+        y += 16
+        
+        self.canvas.create_line(10, y, 370, y, fill='#1a3a48')
+        y += 14
+        
+        self._draw_bar(y, self.anim['cpu'], 'CPU USAGE')
+        y += 30
+        
+        self._draw_bar(y, self.anim['ram'], 'MEMORY')
+        y += 30
+        
+        self._draw_bar(y, self.anim['disk'], 'STORAGE')
+        y += 30
+        
+        temp = self.stats['temp']
+        temp_color = '#00ff88' if temp < 60 else '#ffa502' if temp < 80 else '#ff3333'
+        self.canvas.create_text(14, y, text='CPU TEMP', font=self.fonts['title'], 
+                               fill='#00d4ff', anchor='nw')
+        self.canvas.create_text(362, y+10, text=f'{temp}°C', 
+                               font=self.fonts['norm'], fill=temp_color, anchor='e')
+        y += 28
+        
+        self.canvas.create_line(10, y, 370, y, fill='#1a3a48')
+        y += 14
+        
+        self.canvas.create_text(14, y, text=f'◆ {self.stats["hostname"]}', 
+                               font=self.fonts['title'], fill='#00d4ff', anchor='nw')
+        y += 16
+        self.canvas.create_text(14, y, text=f'UP: {self.stats["uptime"]}', 
+                               font=self.fonts['small'], fill='#94a3dc', anchor='nw')
+    
+    def _draw_network(self):
+        y = 8
+        
+        self.canvas.create_text(190, y, text='NETWORK STATUS', 
+                               font=self.fonts['norm'], fill='#00d4ff', anchor='n')
+        y += 22
+        
+        self.canvas.create_line(10, y, 370, y, fill='#1a3a48')
+        y += 14
+        
+        up = self.stats['up']
+        color_up = '#00ff88' if up < 5 else '#00d4ff' if up < 20 else '#ffa502'
+        self.canvas.create_text(14, y, text='↑ UPLOAD', font=self.fonts['title'], 
+                               fill='#00d4ff', anchor='nw')
+        self.canvas.create_text(362, y+8, text=f'{up:6.1f} MB/s', 
+                               font=self.fonts['norm'], fill=color_up, anchor='e')
+        y += 26
+        
+        down = self.stats['down']
+        color_down = '#00ff88' if down < 10 else '#00d4ff' if down < 50 else '#ffa502'
+        self.canvas.create_text(14, y, text='↓ DOWNLOAD', font=self.fonts['title'], 
+                               fill='#00d4ff', anchor='nw')
+        self.canvas.create_text(362, y+8, text=f'{down:6.1f} MB/s', 
+                               font=self.fonts['norm'], fill=color_down, anchor='e')
+        y += 26
+        
+        ping = self.stats['ping']
+        if ping == 1:
+            ping_txt, ping_color = '✓ ONLINE', '#00ff88'
+        elif ping == 0:
+            ping_txt, ping_color = '✗ OFFLINE', '#ff3333'
+        else:
+            ping_txt, ping_color = '? UNKNOWN', '#ffaa33'
+        
+        self.canvas.create_text(14, y, text='INTERNET', font=self.fonts['title'], 
+                               fill='#00d4ff', anchor='nw')
+        self.canvas.create_text(362, y+8, text=ping_txt, 
+                               font=self.fonts['norm'], fill=ping_color, anchor='e')
+    
+    def _draw_processes(self):
+        y = 8
+
+        self.canvas.create_text(190, y, text='TOP PROCESSES',
+                               font=self.fonts['norm'], fill='#00d4ff', anchor='n')
+        y += 22
+
+        self.canvas.create_line(10, y, 370, y, fill='#1a3a48')
+        y += 10
+
+        for pid, name, cpu in self.stats['processes']:
+            self.canvas.create_text(14, y, text=name[:25], font=self.fonts['small'],
+                                   fill='#c8d8f8', anchor='nw')
+            color = '#ff3333' if cpu > 50 else '#00d4ff' if cpu > 20 else '#00ff88'
+            self.canvas.create_text(300, y+2, text=f'{cpu:5.1f}%',
+                                   font=self.fonts['small'], fill=color, anchor='e')
+
+            # Кнопка "Kill"
+            btn = tk.Button(self.canvas, text='✖', font=('monospace', 7, 'bold'),
+                            fg='#ff3333', bg='#1a2a38', bd=0, cursor='hand2',
+                            activebackground='#ff5555',
+                            command=lambda p=pid: self._kill_process(p))
+            self.canvas.create_window(362, y, window=btn, anchor='ne')
+
+            y += 16
+
+    def _kill_process(self, pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception as e:
+            print(f"Failed to kill {pid}: {e}")
+
+    def _draw(self):
+        self.canvas.delete('all')
+        
+        if self.tab == 0:
+            self._draw_system()
+        elif self.tab == 1:
+            self._draw_network()
+        else:
+            self._draw_processes()
+        
+        # Update tab highlight
+        self.tab_bar.delete('highlight')
+        self.tab_bar.create_line(20 + self.tab * 120, 32, 110 + self.tab * 120, 32, 
+                                fill='#00d4ff', width=2, tags='highlight')
+        
+        self.root.after(50, self._draw)
+    
+    def run(self):
+        self.root.mainloop()
+
+if __name__ == '__main__':
+    AdvancedOverlay().run()
